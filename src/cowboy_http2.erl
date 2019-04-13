@@ -255,6 +255,8 @@ frame(State=#state{http2_machine=HTTP2Machine0}, Frame) ->
 			maybe_ack(State#state{http2_machine=HTTP2Machine}, Frame);
 		{ok, {data, StreamID, IsFin, Data}, HTTP2Machine} ->
 			data_frame(State#state{http2_machine=HTTP2Machine}, StreamID, IsFin, Data);
+		{ok, {lingering_data, StreamID}, HTTP2Machine} ->
+			lingering_data_frame(State#state{http2_machine=HTTP2Machine}, StreamID);
 		{ok, {headers, StreamID, IsFin, Headers, PseudoHeaders, BodyLen}, HTTP2Machine} ->
 			headers_frame(State#state{http2_machine=HTTP2Machine},
 				StreamID, IsFin, Headers, PseudoHeaders, BodyLen);
@@ -286,6 +288,18 @@ maybe_ack(State=#state{socket=Socket, transport=Transport}, Frame) ->
 		_ -> ok
 	end,
 	State.
+
+lingering_data_frame(State=#state{socket=Socket, transport=Transport, http2_machine=HTTP2Machine0}, _StreamID) ->
+	{HTTP2Machine1, ConnSize} = cow_http2_machine:update_window2(HTTP2Machine0),
+	if
+		ConnSize > 0 ->
+			Transport:send(Socket, [
+				cow_http2:window_update(ConnSize)
+			]),
+			State#state{http2_machine=HTTP2Machine1};
+		true ->
+			State#state{http2_machine=HTTP2Machine1}
+	end.
 
 data_frame(State=#state{opts=Opts, streams=Streams}, StreamID, IsFin, Data) ->
 	case Streams of
@@ -573,13 +587,26 @@ commands(State0=#state{socket=Socket, transport=Transport, http2_machine=HTTP2Ma
 	end,
 	commands(State, StreamID, Tail);
 commands(State=#state{socket=Socket, transport=Transport, http2_machine=HTTP2Machine0},
-		StreamID, [{flow, Size}|Tail]) ->
-	Transport:send(Socket, [
-		cow_http2:window_update(Size),
-		cow_http2:window_update(StreamID, Size)
-	]),
-	HTTP2Machine1 = cow_http2_machine:update_window(Size, HTTP2Machine0),
-	HTTP2Machine = cow_http2_machine:update_window(StreamID, Size, HTTP2Machine1),
+		StreamID, [{flow, _Size}|Tail]) ->
+	{HTTP2Machine1, ConnSize} = cow_http2_machine:update_window2(HTTP2Machine0),
+	{HTTP2Machine, StreamSize} = cow_http2_machine:update_window2(StreamID, HTTP2Machine1),
+	case {ConnSize, StreamSize} of
+		{0, 0} ->
+			ok;
+		{ConnSize, 0} ->
+			Transport:send(Socket, [
+				cow_http2:window_update(ConnSize)
+			]);
+		{0, StreamSize} ->
+			Transport:send(Socket, [
+				cow_http2:window_update(StreamID, StreamSize)
+			]);
+		_ ->
+			Transport:send(Socket, [
+				cow_http2:window_update(ConnSize),
+				cow_http2:window_update(StreamID, StreamSize)
+			])
+	end,
 	commands(State#state{http2_machine=HTTP2Machine}, StreamID, Tail);
 %% Supervise a child process.
 commands(State=#state{children=Children}, StreamID, [{spawn, Pid, Shutdown}|Tail]) ->
