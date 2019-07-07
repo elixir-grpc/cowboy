@@ -88,6 +88,7 @@
 %% @todo stream_events/2 (nofin)
 -export([stream_events/3]).
 -export([stream_trailers/2]).
+-export([stream_response/4]).
 -export([push/3]).
 -export([push/4]).
 
@@ -811,6 +812,12 @@ stream_reply(Status, Headers=#{}, Req=#{pid := Pid, streamid := StreamID})
 		when is_integer(Status); is_binary(Status) ->
 	Pid ! {{Pid, StreamID}, {headers, Status, response_headers(Headers, Req)}},
 	done_replying(Req, headers).
+
+-spec stream_response(cowboy:http_status(), resp_body(), cowboy:http_headers(), req()) -> req().
+stream_response(Status, Data, Trailers, #{pid := Pid, streamid := StreamID} = Req) ->
+	% error_logger:info_msg("status ~p", [Status]),
+	Pid ! {{Pid, StreamID}, {full_response, Status, response_headers(#{}, Req), Data, Trailers}},
+	maps:without([resp_cookies, resp_headers, resp_body], Req#{has_sent_resp => true}).
 
 -spec stream_body(resp_body(), fin | nofin, req()) -> ok.
 %% Error out if headers were not sent.

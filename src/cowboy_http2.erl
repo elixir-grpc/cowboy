@@ -131,10 +131,18 @@ init(Parent, Ref, Socket, Transport, ProxyHeader, Opts, Peer, Sock, Cert, Buffer
 		opts=Opts, peer=Peer, sock=Sock, cert=Cert,
 		http2_init=sequence, http2_machine=HTTP2Machine}),
 	Transport:send(Socket, Preface),
+	set_socket_active(Transport, Socket),
+	% error_logger:info_msg("setopts ~p ~p", [Transport, Socket]),
+	% error_logger:info_msg("~p", [Transport:getopts(Socket, [active])]),
 	case Buffer of
 		<<>> -> loop(State, Buffer);
 		_ -> parse(State, Buffer)
 	end.
+
+set_socket_active(Transport=ranch_ssl, Socket) ->
+	ok = Transport:setopts(Socket, [{active, true}]);
+set_socket_active(Transport, Socket) ->
+	ok = Transport:setopts(Socket, [{active, 10000}]).
 
 %% @todo Add an argument for the request body.
 -spec init(pid(), ranch:ref(), inet:socket(), module(),
@@ -160,6 +168,9 @@ init(Parent, Ref, Socket, Transport, ProxyHeader, Opts, Peer, Sock, Cert, Buffer
 	}, ?MODULE, undefined}), %% @todo undefined or #{}?
 	State = set_timeout(State2#state{http2_init=sequence}),
 	Transport:send(Socket, Preface),
+	set_socket_active(Transport, Socket),
+	% error_logger:info_msg("setopts ~p", [Socket]),
+	% error_logger:info_msg("~p", [Transport:getopts(Socket, [active])]),
 	case Buffer of
 		<<>> -> loop(State, Buffer);
 		_ -> parse(State, Buffer)
@@ -167,8 +178,7 @@ init(Parent, Ref, Socket, Transport, ProxyHeader, Opts, Peer, Sock, Cert, Buffer
 
 loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 		opts=Opts, timer=TimerRef, children=Children}, Buffer) ->
-	%% @todo This should only be called when data was read.
-	Transport:setopts(Socket, [{active, once}]),
+	% Transport:setopts(Socket, [{active, once}]),
 	{OK, Closed, Error} = Transport:messages(),
 	InactivityTimeout = maps:get(inactivity_timeout, Opts, 300000),
 	receive
@@ -177,6 +187,13 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 			parse(set_timeout(State), << Buffer/binary, Data/binary >>);
 		{Closed, Socket} ->
 			terminate(State, {socket_error, closed, 'The socket has been closed.'});
+		{tcp_passive, Socket1} ->
+			set_socket_active(Transport, Socket1),
+			loop(State#state{socket=Socket1}, Buffer);
+		{ssl_passive, Socket1} ->
+			% error_logger:info_msg("~p", [Socket]),
+			set_socket_active(Transport, Socket1),
+			loop(State#state{socket=Socket1}, Buffer);
 		{Error, Socket, Reason} ->
 			terminate(State, {socket_error, Reason, 'An error has occurred on the socket.'});
 		%% System messages.
@@ -195,6 +212,7 @@ loop(State=#state{parent=Parent, socket=Socket, transport=Transport,
 			loop(timeout(State, Name, TRef), Buffer);
 		%% Messages pertaining to a stream.
 		{{Pid, StreamID}, Msg} when Pid =:= self() ->
+			% error_logger:error_msg("got msg ~p", [Msg]),
 			loop(info(State, StreamID, Msg), Buffer);
 		%% Exit signal from children.
 		Msg = {'EXIT', Pid, _} ->
@@ -551,6 +569,10 @@ commands(State0, StreamID, [{data, IsFin, Data}|Tail]) ->
 commands(State0, StreamID, [{trailers, Trailers}|Tail]) ->
 	State = maybe_send_data(State0, StreamID, fin, {trailers, maps:to_list(Trailers)}),
 	commands(State, StreamID, Tail);
+commands(State0, StreamID, [{full_response, StatusCode, Headers, Body, Trailers}|Tail]) ->
+	% error_logger:info_msg("got full_resp ~p", [StatusCode]),
+	State = send_full_response(State0, StreamID, StatusCode, Headers, Body, Trailers),
+	commands(State, StreamID, Tail);
 %% Send a push promise.
 %%
 %% @todo Responses sent as a result of a push_promise request
@@ -655,6 +677,32 @@ send_response(State0, StreamID, StatusCode, Headers, Body) ->
 		_ ->
 			State = send_headers(State0, StreamID, nofin, StatusCode, Headers),
 			maybe_send_data(State, StreamID, fin, Body)
+	end.
+
+send_full_response(State=#state{socket=Socket, transport=Transport,
+		http2_machine=HTTP2Machine0}, StreamID, StatusCode, Headers, Body, Trailers) ->
+	{ok, IsFin, HeaderBlock, HTTP2Machine1}
+		= cow_http2_machine:prepare_headers(StreamID, HTTP2Machine0, nofin,
+			#{status => cow_http:status_to_integer(StatusCode)},
+			headers_to_list(Headers)),
+	case cow_http2_machine:send_or_queue_data(StreamID, HTTP2Machine1, IsFin, {data, Body}) of
+		{ok, HTTP2Machine2} ->
+			% error_logger:info_msg("not send ~p", [HTTP2Machine1]),
+			Transport:send(Socket, cow_http2:headers(StreamID, IsFin, HeaderBlock)),
+			State#state{http2_machine=HTTP2Machine2};
+		{send, SendData, HTTP2Machine2} ->
+			% error_logger:info_msg("send ~p", [HTTP2Machine1]),
+			{ok, TrailersBlock, HTTP2Machine}
+				= cow_http2_machine:prepare_trailers(StreamID, HTTP2Machine2, maps:to_list(Trailers)),
+			DataFrames = lists:map(fun({StreamID1, IsFin1, Datas}) ->
+				lists:map(fun({data, Data}) -> cow_http2:data(StreamID1, IsFin1, Data) end, Datas)
+			end, SendData),
+			Transport:send(Socket, [
+				cow_http2:headers(StreamID, IsFin, HeaderBlock),
+				DataFrames,
+				cow_http2:headers(StreamID, fin, TrailersBlock)
+			]),
+			State#state{http2_machine=HTTP2Machine}
 	end.
 
 send_headers(State=#state{socket=Socket, transport=Transport,
